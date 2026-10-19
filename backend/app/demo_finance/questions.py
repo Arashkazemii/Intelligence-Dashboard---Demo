@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from decimal import Decimal
+from typing import Literal
 from urllib import error, request
 
 import psycopg
@@ -17,6 +19,7 @@ from .metrics import IncompleteCoverage, detail_rows
 from .seed import DATASET_ID
 
 router = APIRouter(prefix="/api/demo-finance", tags=["synthetic-finance"])
+logger = logging.getLogger(__name__)
 
 CATALOG = {
     "dataset": DATASET_ID,
@@ -28,7 +31,7 @@ CATALOG = {
     },
     "periods": list(PERIODS),
     "filters": {"opex_category": ["payroll", "shipping", "admin"]},
-    "views": ["card", "trend", "comparison", "bridge"],
+    "views": ["card", "trend", "comparison", "bridge", "dashboard"],
     "limits": "فقط دادهٔ مالی ساختگی آوریل تا سپتامبر ۲۰۲۶؛ علت تجاری مستقل ثبت نشده است.",
 }
 LABELS = {"revenue": "درآمد", "cogs": "بهای کالا", "opex": "هزینهٔ عملیاتی",
@@ -46,11 +49,11 @@ class Question(BaseModel):
 
 class Plan(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    intent: str
+    intent: Literal["overview", "metric", "trend", "compare", "bridge", "out_of_scope", "unavailable"]
     metrics: list[str] = Field(max_length=4)
     periods: list[str] = Field(max_length=6)
     category: str | None = None
-    view: str
+    view: Literal["dashboard", "card", "trend", "comparison", "bridge", "none"]
 
 
 def configured() -> bool:
@@ -73,7 +76,9 @@ def plan_question(question: str) -> Plan:
     prompt = (
         "You classify Persian questions about this synthetic finance dataset. Return ONLY a JSON object "
         "with keys intent, metrics, periods, category, view. No numbers, explanation, SQL or extra keys. "
-        "intent: metric|trend|compare|bridge|out_of_scope|unavailable. "
+        "intent: overview|metric|trend|compare|bridge|out_of_scope|unavailable. "
+        "For a dashboard from all reports or a general finance overview, use overview, "
+        "all four metrics, q2 and q3, category null, view dashboard. "
         "Use out_of_scope for greetings, general research, unrelated opinions. "
         "Use unavailable for related questions asking absent fields or dates; preserve the requested "
         "unknown field in metrics or unknown date in periods so the application can explain it. "
@@ -100,6 +105,7 @@ def plan_question(question: str) -> Plan:
     except (error.URLError, TimeoutError, OSError) as exc:
         raise HTTPException(503, "سرویس مدل در دسترس نیست یا پاسخ‌گویی آن زمان‌بر شد.") from exc
     except (ValueError, KeyError, IndexError, TypeError, ValidationError) as exc:
+        logger.warning("finance model response invalid: %s", type(exc).__name__)
         raise HTTPException(502, "پاسخ ساختاریافتهٔ مدل نامعتبر است.") from exc
 
 
@@ -112,7 +118,7 @@ def execute(plan: Plan, conn: psycopg.Connection) -> dict:
     """Ignore all model prose; read only approved report and parameterized detail rows."""
     if plan.intent == "out_of_scope":
         return {"status": "out_of_scope", "message": SCOPE_MESSAGE, "view": "none", "values": [], "drilldowns": []}
-    if plan.intent not in {"metric", "trend", "compare", "bridge", "unavailable"}:
+    if plan.intent not in {"overview", "metric", "trend", "compare", "bridge", "unavailable"}:
         raise HTTPException(502, "نیت مدل مجاز نیست.")
     for metric in plan.metrics:
         if metric not in LABELS:
@@ -124,13 +130,15 @@ def execute(plan: Plan, conn: psycopg.Connection) -> dict:
         return _unavailable(plan.category)
     if plan.intent == "unavailable":
         return _unavailable((plan.metrics + plan.periods + [plan.category or "فیلد درخواستی"])[0])
-    views = {"metric": "card", "trend": "trend", "compare": "comparison", "bridge": "bridge"}
+    views = {"overview": "dashboard", "metric": "card", "trend": "trend", "compare": "comparison", "bridge": "bridge"}
     if plan.view != views[plan.intent] or not plan.metrics or not plan.periods:
         raise HTTPException(502, "ترکیب نیت و نمایش مدل نامعتبر است.")
     if plan.category and (plan.metrics != ["opex"] or plan.intent != "metric"):
         raise HTTPException(502, "فیلتر دسته برای این شاخص مجاز نیست.")
     if plan.intent == "bridge" and (plan.periods != ["q2", "q3"] or set(plan.metrics) != set(LABELS)):
         raise HTTPException(502, "پل سود فقط برای مقایسهٔ دو فصل معتبر است.")
+    if plan.intent == "overview" and (plan.periods != ["q2", "q3"] or set(plan.metrics) != set(LABELS) or plan.category):
+        raise HTTPException(502, "نمای کلی فقط برای دو فصل و چهار شاخص معتبر است.")
     if plan.intent == "compare" and plan.periods != ["q2", "q3"]:
         raise HTTPException(502, "مقایسه فقط برای دو فصل موجود است.")
     if plan.intent == "trend" and (plan.periods != [f"2026-{m:02d}" for m in range(4, 10)] or plan.category):
@@ -169,12 +177,15 @@ def execute(plan: Plan, conn: psycopg.Connection) -> dict:
     if any(value["coverage"] == "missing" for value in values):
         message = "پوشش داده برای یکی از شاخص‌ها یا دوره‌های درخواستی ناقص است؛ مقدار ناموجود صفر نیست."
         return {"status": "data_unavailable", "message": message, "view": "none",
-                "values": values, "drilldowns": drilldowns, "dataset_id": report["dataset_id"]}
-    if plan.intent == "bridge":
+                "values": values, "drilldowns": drilldowns, "dataset_id": report["dataset_id"],
+                "dataset_version": report["dataset_version"], "widgets": [], "insights": []}
+    if plan.intent in {"bridge", "overview"}:
         bridge = report["profit_bridge"]
         if bridge["coverage"] != "complete":
             return {"status": "data_unavailable", "message": "پوشش داده برای پل سود ناقص است.",
-                    "view": "none", "values": values, "drilldowns": drilldowns}
+                    "view": "none", "values": values, "drilldowns": drilldowns,
+                    "dataset_id": report["dataset_id"], "dataset_version": report["dataset_version"],
+                    "widgets": [], "insights": []}
         def billion(value: str) -> str:
             amount = Decimal(value) / Decimal(1_000_000_000)
             return ("+" if amount > 0 else "") + format(amount, "f")
@@ -189,11 +200,31 @@ def execute(plan: Plan, conn: psycopg.Connection) -> dict:
     elif plan.intent == "compare":
         message = "مقایسهٔ شاخص‌های درخواستی میان فصل دوم و سوم ۲۰۲۶."
     else:
-        message = f"{values[0]['label']} در {plan.periods[0]} سال ۲۰۲۶: {values[0]['amount_toman']} تومان ساختگی."
+        amount = Decimal(values[0]["amount_toman"]) / Decimal(1_000_000_000)
+        message = f"{values[0]['label']} در {plan.periods[0]} سال ۲۰۲۶: {amount:g} میلیارد تومان ساختگی."
+    widgets = {
+        "overview": ["kpis", "trend", "comparison", "bridge", "expense_mix"],
+        "trend": ["trend"], "compare": ["comparison"],
+        "bridge": ["bridge"], "metric": ["card"],
+    }[plan.intent]
+    insights = []
+    if plan.intent in {"overview", "bridge"}:
+        insights.append({
+            "kind": "profit_reconciliation", "title": "تجزیهٔ حسابداری تغییر سود",
+            "amount_toman": bridge["profit_delta_toman"],
+            "basis": "Δسود = Δدرآمد − Δبهای کالا − Δهزینهٔ عملیاتی؛ علت تجاری واقعی از این داده اثبات نمی‌شود.",
+            "components": {key: report["quarter_changes"][key]["amount_toman"] for key in ("revenue", "cogs", "opex")},
+            "periods": ["q2", "q3"],
+            "line_ids": sorted({line_id for value in values for line_id in value["line_ids"] or []}),
+        })
     result = {"status": "answered", "message": message, "view": plan.view,
               "values": values, "drilldowns": drilldowns, "dataset_id": report["dataset_id"],
-              "dataset_version": report["dataset_version"]}
-    if plan.intent == "bridge":
+              "dataset_version": report["dataset_version"],
+              "layout": "overview" if plan.intent == "overview" else "focus",
+              "widgets": widgets, "insights": insights}
+    if plan.intent in {"overview", "bridge", "trend", "compare"}:
+        result["report"] = report
+    if plan.intent in {"bridge", "overview"}:
         result["bridge"] = bridge
     return result
 
@@ -202,13 +233,16 @@ def execute(plan: Plan, conn: psycopg.Connection) -> dict:
 def ask(payload: Question) -> dict:
     if not configured():
         raise HTTPException(503, "مدل پرسش مالی تنظیم نشده است؛ گزارش نمونه فعال است.")
-    plan = plan_question(payload.question)
-    if plan.intent == "out_of_scope":
-        return execute(plan, None)
     # Reject explicit unsupported years even if a model attempts to silently remap them.
     years = re.findall(r"(?<!\d)(?:20\d{2}|۲[۰-۹]{3})(?!\d)", payload.question)
     if any(year.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")) != "2026" for year in years):
         return _unavailable(years[0])
+    unsupported_quarter = re.search(r"فصل\s*(?:اول|یکم|چهارم|۱|۴|1|4)(?!\d)", payload.question)
+    if unsupported_quarter:
+        return _unavailable(unsupported_quarter.group())
+    plan = plan_question(payload.question)
+    if plan.intent == "out_of_scope":
+        return execute(plan, None)
     try:
         with psycopg.connect(_database_url(), connect_timeout=3) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")

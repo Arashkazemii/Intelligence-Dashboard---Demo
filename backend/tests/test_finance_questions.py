@@ -27,6 +27,9 @@ def fake_report(missing=False):
             "quarter_changes": {"revenue": {"amount_toman": str(15 * 10**9)},
                                 "cogs": {"amount_toman": str(17 * 10**9)},
                                 "opex": {"amount_toman": str(6 * 10**9)}},
+            "q3_operating_expense": {"coverage": "complete", "items": [
+                {"category_id": "shipping", "category_name_fa": "حمل", "cost_center_id": "sales",
+                 "amount_toman": str(9 * 10**9), "line_ids": ["shipping-source"]}]},
             "profit_bridge": {"coverage": "complete", "start_profit_toman": str(18 * 10**9),
                               "revenue_effect_toman": str(15 * 10**9),
                               "cogs_effect_toman": str(-17 * 10**9),
@@ -88,6 +91,34 @@ def plan(intent="bridge", metrics=None, periods=None, category=None, view="bridg
             "periods": periods or ["q2", "q3"], "category": category, "view": view}
 
 
+def test_overview_is_five_widgets_with_reconciled_insight(model, data):
+    model.append(plan("overview", view="dashboard"))
+    result = TestClient(app).post("/api/demo-finance/question", json={"question": "داشبورد برام درست کن از تمامی گزارشات"}).json()
+    assert result["status"] == "answered" and result["layout"] == "overview"
+    assert result["widgets"] == ["kpis", "trend", "comparison", "bridge", "expense_mix"]
+    assert len(result["values"]) == 8  # Two quarters, four KPIs; no monthly cards.
+    assert result["dataset_version"] == "1.0.0"
+    insight = result["insights"][0]
+    assert insight["components"] == {"revenue": str(15 * 10**9), "cogs": str(17 * 10**9), "opex": str(6 * 10**9)}
+    assert int(insight["components"]["revenue"]) - int(insight["components"]["cogs"]) - int(insight["components"]["opex"]) == int(insight["amount_toman"]) == -8 * 10**9
+    assert "علت تجاری واقعی" in insight["basis"] and insight["line_ids"]
+
+
+def test_six_month_revenue_profit_trend_has_only_requested_series(model, data):
+    model.append(plan("trend", ["revenue", "operating_profit"], [f"2026-{m:02d}" for m in range(4, 10)], view="trend"))
+    result = TestClient(app).post("/api/demo-finance/question", json={"question": "روند شش‌ماههٔ درآمد و سود چگونه بود؟"}).json()
+    assert result["widgets"] == ["trend"]
+    assert len(result["values"]) == 12
+    assert {value["metric"] for value in result["values"]} == {"revenue", "operating_profit"}
+    assert all(value["line_ids"] for value in result["values"])
+
+
+@pytest.mark.parametrize("question", ["درآمد ۲۰۲۷ چقدر بود؟", "سود فصل چهارم چقدر بود؟"])
+def test_explicit_unsupported_period_is_not_silently_remapped(model, data, question):
+    result = TestClient(app).post("/api/demo-finance/question", json={"question": question}).json()
+    assert result["status"] == "data_unavailable" and result["values"] == []
+
+
 @pytest.mark.parametrize("question", ["چرا سود فصل سوم کمتر شد؟", "علت افت سود عملیاتی از فصل دو به سه چیست؟"])
 def test_persian_paraphrases_use_same_accounting_bridge(model, data, question):
     model.append(plan())
@@ -131,10 +162,12 @@ def test_out_of_scope_and_absent_period(model, data):
     assert absent["status"] == "data_unavailable" and absent["values"] == []
 
 
-def test_invalid_model_and_sql_payload_rejected(model, data):
+def test_invalid_model_and_sql_payload_rejected(model, data, caplog):
     client = TestClient(app)
     model.append({**plan("metric", ["revenue"], ["q3"], view="card"), "sql": "DROP TABLE demo_finance.line"})
     assert client.post("/api/demo-finance/question", json={"question": "درآمد چقدر بود؟"}).status_code == 502
+    assert "finance model response invalid: ValidationError" in caplog.text
+    assert "DROP TABLE" not in caplog.text and "test-placeholder" not in caplog.text
     model.append(plan("metric", ["revenue; DROP TABLE demo_finance.line"], ["q3"], view="card"))
     result = client.post("/api/demo-finance/question", json={"question": "درآمد چقدر بود؟"}).json()
     assert result["status"] == "data_unavailable"

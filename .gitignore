@@ -24,6 +24,8 @@ coverage/
 playwright-report/
 test-results/
 .playwright/
+.playwright-cli/
+graphify-out/
 *.log
 npm-debug.log*
 .DS_Store

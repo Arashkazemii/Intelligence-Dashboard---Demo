@@ -28,8 +28,12 @@ export interface LineResult {
 export interface QuestionValue { metric: Metric; label: string; period: Period; amount_toman: string | null; coverage: 'complete' | 'missing'; line_ids: string[] | null; unit: string }
 export interface QuestionAnswer {
   status: 'answered' | 'out_of_scope' | 'data_unavailable'; message: string
-  view: 'none' | 'card' | 'trend' | 'comparison' | 'bridge'
+  view: 'none' | 'card' | 'trend' | 'comparison' | 'bridge' | 'dashboard'
   values: QuestionValue[]; dataset_id?: string; dataset_version?: string
+  layout?: 'overview' | 'focus'
+  widgets?: ('kpis' | 'card' | 'trend' | 'comparison' | 'bridge' | 'expense_mix')[]
+  insights?: { kind: 'profit_reconciliation'; title: string; amount_toman: string; basis: string; components: Record<'revenue' | 'cogs' | 'opex', string>; periods: ['q2', 'q3']; line_ids: string[] }[]
+  report?: FinanceReport
   drilldowns: { period: Period; bucket: Bucket; category_id: string | null; line_ids: string[] }[]
   bridge?: FinanceReport['profit_bridge']
 }
@@ -46,7 +50,8 @@ export async function askQuestion(question: string, signal?: AbortSignal): Promi
     throw new Error(`خطای API: ${response.status}`)
   }
   const value = await response.json() as QuestionAnswer
-  if (!value || !['answered', 'out_of_scope', 'data_unavailable'].includes(value.status) || !Array.isArray(value.values) || !Array.isArray(value.drilldowns) || typeof value.message !== 'string') throw new Error('پاسخ پرسش نامعتبر است.')
+  const allowedWidgets = ['kpis', 'card', 'trend', 'comparison', 'bridge', 'expense_mix']
+  if (!value || !['answered', 'out_of_scope', 'data_unavailable'].includes(value.status) || !Array.isArray(value.values) || !Array.isArray(value.drilldowns) || typeof value.message !== 'string' || (value.status === 'answered' && (!value.dataset_id || !value.dataset_version || !Array.isArray(value.widgets) || !value.widgets.every(widget => allowedWidgets.includes(widget)) || !Array.isArray(value.insights) || (value.widgets.some(widget => ['trend', 'comparison', 'bridge', 'expense_mix'].includes(widget)) && !value.report)))) throw new Error('پاسخ پرسش نامعتبر است.')
   return value
 }
 
