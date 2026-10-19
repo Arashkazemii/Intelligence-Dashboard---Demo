@@ -1,0 +1,14 @@
+import { exact, monthLabels, type Period, type Bucket, type LineResult } from './finance'
+
+export type Filter = { period: Period; bucket: Bucket; title: string; category_id?: string; cost_center_id?: string; expected?: string | null }
+
+export function Notice({ title, text, retry }: { title: string; text: string; retry?: () => void }) { return <div className="state-notice" role="status"><span className="notice-symbol">◌</span><h2>{title}</h2><p>{text}</p>{retry && <button className="secondary-button" onClick={retry}>تلاش دوباره</button>}</div> }
+
+
+export function Details({ filter, result, loading, error, close, retry }: { filter: Filter; result: LineResult | null; loading: boolean; error: string; close: () => void; retry: () => void }) {
+  const sum = result?.lines?.reduce((total, row) => total + BigInt(row.amount_toman), 0n)
+  const reconciled = result?.bucket_subtotal_toman != null && sum === BigInt(result.bucket_subtotal_toman) && (filter.expected == null || filter.expected === result.bucket_subtotal_toman)
+  return <section className={`detail-panel bucket-${filter.bucket.toLowerCase()}`} id="details"><div className="section-heading"><div><span className="section-kicker">ردیابی عدد</span><h2>{filter.title}</h2><p>جمع سطرهای ثبت‌شدهٔ همین فیلتر؛ این عدد سود دسته یا مرکز هزینه نیست.</p></div><button className="close-button" onClick={close} aria-label="بستن جزئیات">×</button></div>
+    <div className="filter-tags"><span>{filter.period.startsWith('2026') ? monthLabels[filter.period] : filter.period === 'q2' ? 'فصل دوم' : 'فصل سوم'}</span><span>{filter.bucket}</span>{filter.category_id && <span>دسته: {filter.category_id}</span>}{filter.cost_center_id && <span>مرکز: {filter.cost_center_id}</span>}</div>
+    {loading ? <p className="loading-text">در حال دریافت سطرها…</p> : error ? <Notice title="جزئیات دریافت نشد" text={error} retry={retry} /> : result?.coverage === 'missing' ? <Notice title="دادهٔ این بخش ناقص است" text="API پوشش این بازه را ناقص اعلام کرده است." /> : result?.lines?.length === 0 ? <Notice title="سطر ثبت‌شده‌ای نیست" text="جمع این فیلتر صفر است." /> : result?.lines ? <><div className="detail-summary"><div><small>جمع API</small><strong>{exact(result.bucket_subtotal_toman)} <em>تومان ساختگی</em></strong></div><span className={reconciled ? 'reconciled' : 'mismatch'}>{reconciled ? 'جمع سطرها تطبیق دارد' : 'اختلاف در تطبیق سطرها'}</span></div><div className="table-scroll"><table><thead><tr><th>تاریخ</th><th>سند</th><th>شناسهٔ سطر</th><th>دسته / مرکز</th><th>مبلغ، تومان</th></tr></thead><tbody>{result.lines.map(row => <tr key={row.line_id}><td dir="ltr">{row.posted_local_date}</td><td dir="ltr">{row.document_id}</td><td dir="ltr">{row.line_id}</td><td>{row.category_id} / {row.cost_center_id}</td><td className="amount-cell">{exact(row.amount_toman)}</td></tr>)}</tbody></table></div></> : null}</section>
+}

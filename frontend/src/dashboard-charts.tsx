@@ -1,3 +1,5 @@
+import { useReducedMotion } from 'motion/react'
+import { Disclosure } from './ui'
 import type { ReactNode } from 'react'
 import { Bar, BarChart, Cell, ReferenceLine, Tooltip, XAxis, YAxis } from 'recharts'
 import { EvilAreaChart } from './components/evilcharts/charts/recharts-area-chart'
@@ -30,7 +32,7 @@ export function metricColor(key: string): string {
   return categoryColors[hash % categoryColors.length]
 }
 
-type ChartContext = { spec: ChartSpec; dataset: DashboardDataset; config: ChartConfig; fields: DashboardField[] }
+type ChartContext = { spec: ChartSpec; dataset: DashboardDataset; config: ChartConfig; fields: DashboardField[]; animate: boolean }
 type ChartRenderer = (context: ChartContext) => ReactNode
 const axisTick = { fill: 'var(--chart-label)', fontSize: 11 }
 const chartMargin = { top: 12, right: 12, bottom: 10, left: 4 }
@@ -57,23 +59,23 @@ const tooltip = (context: ChartContext) => <Tooltip content={<ChartTooltip conte
 
 function renderLine(context: ChartContext) {
   const { spec, dataset, config } = context
-  return <EvilLineChart data={dataset.rows} config={config} animationType="none" curveType="linear" chartProps={{ margin: chartMargin }}>
+  return <EvilLineChart data={dataset.rows} config={config} animationType="left-to-right" curveType="linear" chartProps={{ margin: chartMargin }}>
     <EvilLineChart.Grid stroke="var(--chart-grid)" />
     <EvilLineChart.XAxis dataKey={spec.x} tick={axisTick} minTickGap={12} />
     <EvilLineChart.YAxis tick={axisTick} tickFormatter={tick} width={44} />
     {tooltip(context)}
-    {spec.series.map(series => <EvilLineChart.Line key={series.field} dataKey={series.field} animationType="none" strokeVariant={baselineSeries(context.fields.find(field => field.key === series.field)!, context.fields) ? 'dashed' : 'solid'} strokeWidth={2.5} lineProps={{ isAnimationActive: false }}><EvilLineChart.Dot /></EvilLineChart.Line>)}
+    {spec.series.map(series => <EvilLineChart.Line key={series.field} dataKey={series.field} animationType="left-to-right" strokeVariant={baselineSeries(context.fields.find(field => field.key === series.field)!, context.fields) ? 'dashed' : 'solid'} strokeWidth={2.5} lineProps={{ isAnimationActive: false }}><EvilLineChart.Dot /></EvilLineChart.Line>)}
   </EvilLineChart>
 }
 
 function renderArea(context: ChartContext) {
   const { spec, dataset, config } = context
-  return <EvilAreaChart data={dataset.rows} config={config} animationType="none" curveType="linear" chartProps={{ margin: chartMargin }}>
+  return <EvilAreaChart data={dataset.rows} config={config} animationType="left-to-right" curveType="linear" chartProps={{ margin: chartMargin }}>
     <EvilAreaChart.Grid stroke="var(--chart-grid)" />
     <EvilAreaChart.XAxis dataKey={spec.x} tick={axisTick} minTickGap={12} />
     <EvilAreaChart.YAxis tick={axisTick} tickFormatter={tick} width={44} />
     {tooltip(context)}
-    {spec.series.map(series => <EvilAreaChart.Area key={series.field} dataKey={series.field} animationType="none" strokeVariant="solid" areaProps={{ dataKey: series.field, isAnimationActive: false }} />)}
+    {spec.series.map(series => <EvilAreaChart.Area key={series.field} dataKey={series.field} animationType="left-to-right" strokeVariant="solid" areaProps={{ dataKey: series.field, isAnimationActive: false }} />)}
   </EvilAreaChart>
 }
 
@@ -81,27 +83,27 @@ function renderBar(context: ChartContext) {
   const { spec, dataset, config } = context
   const horizontal = spec.type === 'horizontal_bar'
   const data = horizontal ? [...dataset.rows].sort((left, right) => Number(right[spec.series[0].field]) - Number(left[spec.series[0].field])) : dataset.rows
-  return <EvilBarChart data={data} config={config} animationType="none" layout={horizontal ? 'horizontal' : 'vertical'} stackType={spec.type === 'stacked_bar' ? 'stacked' : 'default'} chartProps={{ margin: chartMargin }}>
+  return <EvilBarChart data={data} config={config} animationType="left-to-right" layout={horizontal ? 'horizontal' : 'vertical'} stackType={spec.type === 'stacked_bar' ? 'stacked' : 'default'} chartProps={{ margin: chartMargin }}>
     <EvilBarChart.Grid stroke="var(--chart-grid)" />
     <EvilBarChart.XAxis dataKey={horizontal ? undefined : spec.x} type={horizontal ? 'number' : 'category'} tick={axisTick} tickFormatter={horizontal ? tick : undefined} interval={0} />
     <EvilBarChart.YAxis dataKey={horizontal ? spec.x : undefined} type={horizontal ? 'category' : 'number'} tick={axisTick} tickFormatter={horizontal ? undefined : tick} width={horizontal ? 112 : 44} />
     {tooltip(context)}
-    {spec.series.map(series => <EvilBarChart.Bar key={series.field} dataKey={series.field} animationType="none" variant={baselineSeries(context.fields.find(field => field.key === series.field)!, context.fields) ? 'hatched' : 'default'} radius={4} barProps={{ isAnimationActive: false }} />)}
+    {spec.series.map(series => <EvilBarChart.Bar key={series.field} dataKey={series.field} animationType="left-to-right" variant={baselineSeries(context.fields.find(field => field.key === series.field)!, context.fields) ? 'hatched' : 'default'} radius={4} barProps={{ isAnimationActive: false }} />)}
   </EvilBarChart>
 }
 
 function renderComposed(context: ChartContext) {
   const { spec, dataset, config, fields } = context
   const right = spec.series.some(series => series.axis === 'right')
-  return <EvilComposedChart data={dataset.rows} config={config} animationType="none" curveType="linear" chartProps={{ margin: chartMargin }}>
+  return <EvilComposedChart data={dataset.rows} config={config} animationType="left-to-right" curveType="linear" chartProps={{ margin: chartMargin }}>
     <EvilComposedChart.Grid stroke="var(--chart-grid)" />
     <EvilComposedChart.XAxis dataKey={spec.x} tick={axisTick} minTickGap={12} />
     <EvilComposedChart.YAxis yAxisId="left" tick={axisTick} tickFormatter={tick} width={44} />
     {right && <EvilComposedChart.YAxis yAxisId="right" orientation="right" tick={axisTick} tickFormatter={tick} width={48} />}
     {tooltip(context)}
     {spec.series.map((series, index) => index === 0
-      ? <EvilComposedChart.Bar key={series.field} dataKey={series.field} animationType="none" barProps={{ isAnimationActive: false, yAxisId: series.axis, name: fields.find(field => field.key === series.field)?.label }} />
-      : <EvilComposedChart.Line key={series.field} dataKey={series.field} animationType="none" lineProps={{ isAnimationActive: false, yAxisId: series.axis, strokeWidth: 2.5 }} />)}
+      ? <EvilComposedChart.Bar key={series.field} dataKey={series.field} animationType="left-to-right" barProps={{ isAnimationActive: false, yAxisId: series.axis, name: fields.find(field => field.key === series.field)?.label }} />
+      : <EvilComposedChart.Line key={series.field} dataKey={series.field} animationType="left-to-right" lineProps={{ isAnimationActive: false, yAxisId: series.axis, strokeWidth: 2.5 }} />)}
   </EvilComposedChart>
 }
 
@@ -121,7 +123,7 @@ function renderPie(context: ChartContext) {
   const rows = categoryRows(context)
   return <EvilPieChart data={rows} dataKey={spec.series[0].field} nameKey="_categoryKey" config={categoryConfig(context, rows)}>
     {tooltip(context)}
-    <EvilPieChart.Pie innerRadius={spec.type === 'donut' ? '58%' : 0} outerRadius="85%" paddingAngle={2} cornerRadius={3} pieProps={{ isAnimationActive: false }} />
+    <EvilPieChart.Pie innerRadius={spec.type === 'donut' ? '58%' : 0} outerRadius="85%" paddingAngle={2} cornerRadius={3} pieProps={{ isAnimationActive: context.animate, animationDuration: 650 }} />
   </EvilPieChart>
 }
 
@@ -130,7 +132,7 @@ function renderRadial(context: ChartContext) {
   const rows = categoryRows(context)
   return <EvilRadialChart data={rows} nameKey="_categoryKey" config={categoryConfig(context, rows)} max={dataset.total} innerRadius="24%" outerRadius="90%">
     {tooltip(context)}
-    <EvilRadialChart.RadialBar dataKey={spec.series[0].field} radialBarProps={{ isAnimationActive: false }} />
+    <EvilRadialChart.RadialBar dataKey={spec.series[0].field} radialBarProps={{ isAnimationActive: context.animate, animationDuration: 650 }} />
   </EvilRadialChart>
 }
 
@@ -141,7 +143,7 @@ function renderRadar(context: ChartContext) {
     <EvilRadarChart.PolarAngleAxis dataKey={spec.x} tick={axisTick} />
     <EvilRadarChart.PolarRadiusAxis domain={[0, 'auto']} tickFormatter={tick} tick={axisTick} />
     {tooltip(context)}
-    {spec.series.map(series => <EvilRadarChart.Radar key={series.field} dataKey={series.field} radarProps={{ isAnimationActive: false }} />)}
+    {spec.series.map(series => <EvilRadarChart.Radar key={series.field} dataKey={series.field} radarProps={{ isAnimationActive: context.animate, animationDuration: 650 }} />)}
   </EvilRadarChart>
 }
 
@@ -162,7 +164,7 @@ function renderWaterfall(context: ChartContext) {
     <YAxis tick={axisTick} tickFormatter={tick} tickLine={false} axisLine={false} width={44} />
     <ReferenceLine y={0} stroke="var(--chart-grid)" />
     {tooltip(context)}
-    <Bar dataKey="_range" isAnimationActive={false} radius={3}>{dataset.rows.map(row => <Cell key={row.id} fill={row.role === 'delta' ? Number(row[spec.series[0].field]) < 0 ? '#e3aa91' : '#8de3c8' : 'var(--metric-profit)'} />)}</Bar>
+    <Bar dataKey="_range" isAnimationActive={context.animate} animationDuration={600} radius={3}>{dataset.rows.map(row => <Cell key={row.id} fill={row.role === 'delta' ? Number(row[spec.series[0].field]) < 0 ? '#e3aa91' : '#8de3c8' : 'var(--metric-profit)'} />)}</Bar>
   </BarChart></ChartContainer>
 }
 
@@ -178,7 +180,7 @@ export const chartRegistry: Record<ChartType, { label: string; render: ChartRend
 export function SourceControls({ rows, select }: { rows: { id: string; label: string; source_ids: string[]; drilldowns: SourceFilter[] }[]; select: (filter: SourceFilter, title: string) => void }) {
   const available = rows.filter(row => row.drilldowns.length > 0).map(row => ({ ...row, drilldowns: [...new Map(row.drilldowns.map(filter => [JSON.stringify([filter.period, filter.bucket, filter.category_id ?? null, filter.cost_center_id ?? null]), filter])).values()] }))
   if (!available.length) return <p className="source-unavailable">مسیر سطر منبع برای این داده موجود نیست.</p>
-  return <details className="dashboard-sources"><summary>مشاهدهٔ سطرهای منبع</summary><div>{available.map(row => <div className="dashboard-source-row" key={row.id}><span>{row.label} <small>({new Set(row.source_ids).size} سطر)</small></span><div>{row.drilldowns.map((filter, index) => <button type="button" key={`${filter.period}-${filter.bucket}-${filter.category_id ?? ''}-${index}`} onClick={() => select(filter, `${row.label} · ${periodLabel(filter.period)}`)}>{periodLabel(filter.period)} · {filter.bucket === 'REVENUE' ? 'درآمد' : filter.bucket === 'COGS' ? 'بهای کالا' : 'هزینهٔ عملیاتی'}{filter.category_id ? ` · ${filter.category_id}` : ''}</button>)}</div></div>)}</div></details>
+  return <Disclosure className="dashboard-sources" title="مشاهدهٔ سطرهای منبع"><div>{available.map(row => <div className="dashboard-source-row" key={row.id}><span>{row.label} <small>({new Set(row.source_ids).size} سطر)</small></span><div>{row.drilldowns.map((filter, index) => <button type="button" key={`${filter.period}-${filter.bucket}-${filter.category_id ?? ''}-${index}`} onClick={() => select(filter, `${row.label} · ${periodLabel(filter.period)}`)}>{periodLabel(filter.period)} · {filter.bucket === 'REVENUE' ? 'درآمد' : filter.bucket === 'COGS' ? 'بهای کالا' : 'هزینهٔ عملیاتی'}{filter.category_id ? ` · ${filter.category_id}` : ''}</button>)}</div></div>)}</div></Disclosure>
 }
 
 export function DatasetTable({ dataset, columns, title }: { dataset: DashboardDataset; columns: string[]; title?: string }) {
@@ -187,10 +189,11 @@ export function DatasetTable({ dataset, columns, title }: { dataset: DashboardDa
 }
 
 export function DashboardChart({ spec, dataset, select }: { spec: ChartSpec; dataset: DashboardDataset; select: (filter: SourceFilter, title: string) => void }) {
+  const reduce = useReducedMotion()
   const renderer = chartRegistry[spec.type]
   const fields = spec.series.map(series => dataset.fields.find(field => field.key === series.field)).filter((field): field is DashboardField => Boolean(field))
   const config = Object.fromEntries(fields.map(field => [field.key, { label: field.label, colors: { dark: [metricColor(field.metric ?? field.key)], light: [metricColor(field.metric ?? field.key)] } }])) as ChartConfig
-  const context = { spec, dataset, config, fields }
+  const context = { spec, dataset, config, fields, animate: !reduce }
   const complete = dataset.coverage === 'complete' && dataset.rows.length > 0 && fields.length === spec.series.length
   const category = ['pie', 'donut', 'radial'].includes(spec.type)
   const legend = category ? dataset.rows.map(row => ({ key: row.id, label: String(row[spec.x]), color: metricColor(categoryKey(row)), pattern: false })) : fields.map(field => ({ key: field.key, label: field.label, color: metricColor(field.metric ?? field.key), pattern: baselineSeries(field, fields) }))
@@ -200,7 +203,7 @@ export function DashboardChart({ spec, dataset, select }: { spec: ChartSpec; dat
       {spec.type === 'composed' && spec.series.some(series => series.axis === 'right') && <p className="axis-note">محور چپ: {fields.filter(field => spec.series.find(series => series.field === field.key)?.axis === 'left').map(field => `${field.label} (${field.unit})`).join('، ')}؛ محور راست: {fields.filter(field => spec.series.find(series => series.field === field.key)?.axis === 'right').map(field => `${field.label} (${field.unit})`).join('، ')}</p>}
       {spec.type === 'waterfall' && <p className="axis-note">این پل تطبیق حسابداری تغییر سود است؛ علت تجاری را اثبات نمی‌کند.</p>}
       {spec.type === 'radial' && <p className="axis-note">هر کمان نسبت به کل معتبر {dataset.total == null ? '' : fa.format(dataset.total)} {fields[0]?.unit} سنجیده می‌شود.</p>}
-      <details className="dashboard-data"><summary>مشاهدهٔ دادهٔ نمودار</summary><DatasetTable dataset={dataset} columns={[spec.x, ...spec.series.map(series => series.field)]} title={spec.title} /></details>
+      <Disclosure className="dashboard-data" title="مشاهدهٔ دادهٔ نمودار"><DatasetTable dataset={dataset} columns={[spec.x, ...spec.series.map(series => series.field)]} title={spec.title} /></Disclosure>
       <SourceControls rows={dataset.rows} select={select} />
     </> : <p className="empty" role="status">{!renderer ? 'نوع نمودار پشتیبانی نمی‌شود.' : 'دادهٔ کافی و کامل برای این نمودار موجود نیست.'}</p>}
     {dataset.limitations.length > 0 && <ul className="component-limitations">{dataset.limitations.map(item => <li key={item}>{item}</li>)}</ul>}

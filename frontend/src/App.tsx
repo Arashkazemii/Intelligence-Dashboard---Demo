@@ -1,35 +1,16 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react'
-import { askQuestion, compact, delta, exact, loadLines, loadQuestionCapability, loadReport, metricLabels, monthLabels, type Bucket, type Expense, type FinanceReport, type LineResult, type Metric, type Period, type QuestionAnswer } from './finance'
-import type { SourceFilter } from './dashboard-types'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { AnimatePresence, motion, MotionConfig } from 'motion/react'
+import Landing from './Landing'
+import Workspace from './Workspace'
+import { Brand } from './ui'
+import { compact, delta, loadLines, loadReport, metricLabels, monthLabels, type Bucket, type Expense, type FinanceReport, type LineResult, type Metric, type Period } from './finance'
 
-type Filter = { period: Period; bucket: Bucket; title: string; category_id?: string; cost_center_id?: string; expected?: string | null }
-const questions = ['چرا سود عملیاتی در فصل سوم کاهش یافت؟', 'روند شش‌ماههٔ درآمد و سود چگونه بود؟', 'هزینه‌های عملیاتی فصل سوم از چه بخش‌هایی تشکیل شد؟']
+import { Details, Notice, type Filter } from './SourceDetails'
 const metricBuckets = { revenue: 'REVENUE', cogs: 'COGS', opex: 'OPEX' } as const
-const DynamicDashboard = lazy(() => import('./dashboard'))
 const TrendChart = lazy(() => import('./charts').then(module => ({ default: module.TrendChart })))
 const ComparisonChart = lazy(() => import('./charts').then(module => ({ default: module.ComparisonChart })))
 const ExpenseDonut = lazy(() => import('./charts').then(module => ({ default: module.ExpenseDonut })))
 
-function Brand() { return <span className="brand"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span><span>ویرا<span className="brand-accent">دیتا</span><small>INTELLIGENCE</small></span></span> }
-
-function Landing({ open, ask }: { open: () => void; ask: (question: string) => void }) {
-  const [query, setQuery] = useState('')
-  const [message, setMessage] = useState('')
-  function submit(event: FormEvent) { event.preventDefault(); if (query.trim().length < 2) { setMessage('پرسش را وارد کنید.'); return }; ask(query.trim()) }
-  return <div className="landing dark"><div className="landing-glow" aria-hidden="true" /><div className="data-flow" aria-hidden="true">{Array.from({ length: 7 }, (_, index) => <span key={index} />)}</div>
-    <header className="landing-header"><span className="entrance scale" style={{ animationDelay: '.06s' }}><Brand /></span><span className="header-note entrance soft" style={{ animationDelay: '.2s' }}>دموی تحلیل مالی</span><button className="header-link entrance scale" style={{ animationDelay: '.32s' }} onClick={open}>گزارش نمونه ↗</button></header>
-    <main className="landing-main"><div className="hero-content"><div className="eyebrow entrance pop" style={{ animationDelay: '.24s' }}><span className="sparkle" aria-hidden="true">✦</span> از داده تا بینشِ قابل بررسی</div>
-      <h1><span className="headline-mask"><span className="entrance mask" style={{ animationDelay: '.42s' }}>داستان پشت عددها را</span></span><span className="headline-mask"><span className="entrance mask accent-line" style={{ animationDelay: '.62s' }}>واضح‌تر ببینید.</span></span></h1>
-      <p className="hero-lede entrance soft" style={{ animationDelay: '.82s' }}>گزارش مالی نمونه را باز کنید؛ از تغییر سود تا سطرهای سازندهٔ هر هزینه، مسیر تحلیل را دنبال کنید.</p>
-      <form className="question-form entrance rise" style={{ animationDelay: '.98s' }} onSubmit={submit}><label htmlFor="question">سؤال خود را بنویسید</label><div className="question-box"><input id="question" value={query} onChange={event => { setQuery(event.target.value); setMessage('') }} placeholder="مثلاً چرا سود فصل سوم کمتر شد؟" /><button type="submit" aria-label="ارسال سؤال">↖</button></div></form>
-      {message && <p className="question-message" role="status">{message}</p>}
-      <div className="sample-questions entrance soft" style={{ animationDelay: '1.1s' }}><span>سؤال‌های آماده:</span>{questions.map(question => <button key={question} onClick={() => ask(question)}>{question}</button>)}</div>
-      <button className="primary-button entrance rise" style={{ animationDelay: '1.22s' }} onClick={open}>مشاهدهٔ گزارش نمونه <span>↗</span></button></div></main>
-    <footer className="landing-footer entrance stat" style={{ animationDelay: '1.42s' }}><span><i className="live-dot" /> داده‌های مالی کاملاً ساختگی</span><span>فصل دوم و سوم ۲۰۲۶ · تومان</span><span>گزارش قابل بررسی تا سطح سطر</span></footer>
-  </div>
-}
-
-function Notice({ title, text, retry }: { title: string; text: string; retry?: () => void }) { return <div className="state-notice" role="status"><span className="notice-symbol">◌</span><h2>{title}</h2><p>{text}</p>{retry && <button className="secondary-button" onClick={retry}>تلاش دوباره</button>}</div> }
 
 function MetricCard({ metric, label, q2, q3, change, openQ2, openQ3, profit }: { metric: Metric; label: string; q2: string | null; q3: string | null; change: string | null; openQ2?: () => void; openQ3?: () => void; profit?: boolean }) {
   const direction = change == null ? 'unknown' : BigInt(change) < 0n ? 'negative' : 'positive'
@@ -52,13 +33,6 @@ function Bridge({ report, select }: { report: FinanceReport; select: (filter: Fi
   return <div className="bridge">{steps.map((step, index) => { const content = <><span className="bridge-order">۰{index + 1}</span><span className="bridge-bar" style={{ width: `${Math.max(16, Math.abs(Number(step.value ?? 0)) / max * 100)}%` }} /><span className="bridge-label">{step.label}</span><strong>{step.bucket ? delta(step.value) : compact(step.value)}</strong></>; return <div className={`bridge-step ${step.tone} ${step.bucket ? `bridge-${step.bucket.toLowerCase()}` : ''}`} key={step.label}><div>{content}</div>{step.bucket && <div className="bridge-sources"><button onClick={() => select({ period: 'q2', bucket: step.bucket!, title: `${step.label}؛ سطرهای فصل دوم` })}>سطرهای فصل دوم</button><button onClick={() => select({ period: 'q3', bucket: step.bucket!, title: `${step.label}؛ سطرهای فصل سوم` })}>سطرهای فصل سوم</button></div>}</div> })}</div>
 }
 
-function Details({ filter, result, loading, error, close, retry }: { filter: Filter; result: LineResult | null; loading: boolean; error: string; close: () => void; retry: () => void }) {
-  const sum = result?.lines?.reduce((total, row) => total + BigInt(row.amount_toman), 0n)
-  const reconciled = result?.bucket_subtotal_toman != null && sum === BigInt(result.bucket_subtotal_toman) && (filter.expected == null || filter.expected === result.bucket_subtotal_toman)
-  return <section className={`detail-panel bucket-${filter.bucket.toLowerCase()}`} id="details"><div className="section-heading"><div><span className="section-kicker">ردیابی عدد</span><h2>{filter.title}</h2><p>جمع سطرهای ثبت‌شدهٔ همین فیلتر؛ این عدد سود دسته یا مرکز هزینه نیست.</p></div><button className="close-button" onClick={close} aria-label="بستن جزئیات">×</button></div>
-    <div className="filter-tags"><span>{filter.period.startsWith('2026') ? monthLabels[filter.period] : filter.period === 'q2' ? 'فصل دوم' : 'فصل سوم'}</span><span>{filter.bucket}</span>{filter.category_id && <span>دسته: {filter.category_id}</span>}{filter.cost_center_id && <span>مرکز: {filter.cost_center_id}</span>}</div>
-    {loading ? <p className="loading-text">در حال دریافت سطرها…</p> : error ? <Notice title="جزئیات دریافت نشد" text={error} retry={retry} /> : result?.coverage === 'missing' ? <Notice title="دادهٔ این بخش ناقص است" text="API پوشش این بازه را ناقص اعلام کرده است." /> : result?.lines?.length === 0 ? <Notice title="سطر ثبت‌شده‌ای نیست" text="جمع این فیلتر صفر است." /> : result?.lines ? <><div className="detail-summary"><div><small>جمع API</small><strong>{exact(result.bucket_subtotal_toman)} <em>تومان ساختگی</em></strong></div><span className={reconciled ? 'reconciled' : 'mismatch'}>{reconciled ? 'جمع سطرها تطبیق دارد' : 'اختلاف در تطبیق سطرها'}</span></div><div className="table-scroll"><table><thead><tr><th>تاریخ</th><th>سند</th><th>شناسهٔ سطر</th><th>دسته / مرکز</th><th>مبلغ، تومان</th></tr></thead><tbody>{result.lines.map(row => <tr key={row.line_id}><td dir="ltr">{row.posted_local_date}</td><td dir="ltr">{row.document_id}</td><td dir="ltr">{row.line_id}</td><td>{row.category_id} / {row.cost_center_id}</td><td className="amount-cell">{exact(row.amount_toman)}</td></tr>)}</tbody></table></div></> : null}</section>
-}
 
 function Report({ back }: { back: () => void }) {
   const [report, setReport] = useState<FinanceReport | null>(null)
@@ -86,28 +60,22 @@ function Report({ back }: { back: () => void }) {
   </div>
 }
 
-function QuestionPage({ initial, back, openReport }: { initial: string; back: () => void; openReport: () => void }) {
-  const [query, setQuery] = useState(initial)
-  const [answer, setAnswer] = useState<QuestionAnswer | null>(null)
-  const [capability, setCapability] = useState<boolean | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [filter, setFilter] = useState<Filter | null>(null)
-  const [lines, setLines] = useState<LineResult | null>(null)
-  const [detailError, setDetailError] = useState('')
-  const [detailLoading, setDetailLoading] = useState(false)
-  const [detailReload, setDetailReload] = useState(0)
-  const detailRef = useRef<HTMLDivElement>(null)
-  useEffect(() => { const controller = new AbortController(); loadQuestionCapability(controller.signal).then(value => setCapability(value.enabled)).catch(() => setCapability(false)); return () => controller.abort() }, [])
-  useEffect(() => { if (!initial || capability !== true) return; const controller = new AbortController(); setLoading(true); askQuestion(initial, controller.signal).then(setAnswer).catch(value => { if (!controller.signal.aborted) setError(String(value.message ?? value)) }).finally(() => { if (!controller.signal.aborted) setLoading(false) }); return () => controller.abort() }, [initial, capability])
-  useEffect(() => { if (!filter) return; const controller = new AbortController(); setLines(null); setDetailError(''); setDetailLoading(true); loadLines(filter, controller.signal).then(setLines).catch(value => { if (!controller.signal.aborted) setDetailError(String(value.message ?? value)) }).finally(() => { if (!controller.signal.aborted) setDetailLoading(false) }); return () => controller.abort() }, [filter, detailReload])
-  async function submit(event: FormEvent) { event.preventDefault(); const question = query.trim(); if (question.length < 2) { setError('پرسش را وارد کنید.'); return }; setError(''); setAnswer(null); setFilter(null); setLoading(true); try { setAnswer(await askQuestion(question)) } catch (value) { setError(String((value as Error).message ?? value)) } finally { setLoading(false) } }
-  function selectSource(source: SourceFilter, title: string) { setFilter({ ...source, category_id: source.category_id ?? undefined, cost_center_id: source.cost_center_id ?? undefined, title }); window.setTimeout(() => { detailRef.current?.focus({ preventScroll: true }); detailRef.current?.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'start' }) }, 50) }
-  return <div className="report dark"><header className="report-header"><button className="plain-brand" onClick={back}><Brand /></button><nav><button className="back-link" onClick={openReport}>گزارش نمونه</button></nav><button className="back-link" onClick={back}>صفحهٔ شروع ↗</button></header><main className="report-container question-page"><div className="report-intro"><div><span className="section-kicker">پرسش آزاد / دادهٔ مالی نمایشی</span><h1>از داده بپرسید</h1><p>فصل دوم و سوم ۲۰۲۶، با عددهای قابل ردیابی تا سطر مالی.</p></div><div className="synthetic-stamp">دادهٔ ساختگی<small>واحد: تومان ساختگی</small></div></div>
-    <section className="report-section question-workspace"><form className="question-form" onSubmit={submit}><label htmlFor="analysis-question">پرسش فارسی</label><div className="question-box"><input id="analysis-question" value={query} onChange={event => setQuery(event.target.value)} maxLength={500} placeholder="مثلاً هزینهٔ حمل چقدر بود؟" disabled={loading || capability === false} /><button type="submit" disabled={loading || capability === false} aria-label="تحلیل پرسش">{loading ? '…' : '↖'}</button></div></form><div className="question-suggestions">{['داشبورد بده', 'داشبورد گزارشی بده', 'داشبورد حمل بده', 'نقاط قوت و ضعف را نشان بده', 'روند درآمد را نشان بده', 'فصل دوم و سوم را مقایسه کن'].map(item => <button key={item} type="button" onClick={() => setQuery(item)}>{item}</button>)}</div>
-      {capability === false && <Notice title="پرسش آزاد هنوز فعال نیست" text="برای فعال‌سازی، نشانی سرویس مدل، نام مدل و API key را در محیط backend تنظیم کنید. گزارش نمونه همچنان فعال است." />}{capability === null && <p className="loading-text" role="status">در حال بررسی وضعیت سرویس پرسش…</p>}{loading && <p className="loading-text" role="status">در حال تحلیل پرسش و خواندن داده…</p>}{error && <Notice title="پاسخ دریافت نشد" text={error} retry={() => { if (query.trim()) void submit({ preventDefault() {} } as FormEvent) }} />}</section>
-    {answer && <Suspense fallback={<p className="loading-text">در حال آماده‌سازی داشبورد…</p>}><DynamicDashboard answer={answer} select={selectSource} /></Suspense>}
-    {filter && <div ref={detailRef} tabIndex={-1} role="region" aria-label="سطرهای منبع انتخاب‌شده"><Details filter={filter} result={lines} loading={detailLoading} error={detailError} close={() => setFilter(null)} retry={() => setDetailReload(value => value + 1)} /></div>}</main></div>
+export default function App() {
+  const route = () => location.hash === '#report' ? 'report' : location.hash === '#question' ? 'question' : 'landing'
+  const [page, setPage] = useState(route)
+  useEffect(() => {
+    const sync = () => {
+      if (!['', '#', '#report', '#question'].includes(location.hash)) return
+      setPage(route())
+      scrollTo(0, 0)
+    }
+    addEventListener('hashchange', sync)
+    addEventListener('popstate', sync)
+    return () => { removeEventListener('hashchange', sync); removeEventListener('popstate', sync) }
+  }, [])
+  function navigate(target: string) { location.hash = target; scrollTo(0, 0) }
+  function back() { navigate('') }
+  return <MotionConfig reducedMotion="user" transition={{ duration: .2 }}><AnimatePresence mode="wait"><motion.div key={page} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: .14 }} onAnimationComplete={() => document.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true })}>
+    {page === 'landing' ? <Landing start={() => navigate('question')} openReport={() => navigate('report')} /> : page === 'report' ? <Report back={back} /> : <Workspace back={back} openReport={() => navigate('report')} />}
+  </motion.div></AnimatePresence></MotionConfig>
 }
-
-export default function App() { const [page, setPage] = useState<'landing' | 'report' | 'question'>(() => location.hash === '#report' ? 'report' : location.hash === '#question' ? 'question' : 'landing'); const [initial, setInitial] = useState(''); useEffect(() => { const sync = () => setPage(location.hash === '#report' ? 'report' : location.hash === '#question' ? 'question' : 'landing'); addEventListener('hashchange', sync); return () => removeEventListener('hashchange', sync) }, []); function open() { location.hash = 'report'; setPage('report'); scrollTo(0, 0) } function ask(question: string) { setInitial(question); location.hash = 'question'; setPage('question'); scrollTo(0, 0) } function back() { history.pushState(null, '', location.pathname); setPage('landing'); scrollTo(0, 0) } return page === 'landing' ? <Landing open={open} ask={ask} /> : page === 'report' ? <Report back={back} /> : <QuestionPage initial={initial} back={back} openReport={open} /> }
