@@ -1,251 +1,287 @@
-"""Bounded question planning and source-linked execution for the finance demo."""
+"""Bounded data planning, verified finance execution, and model dashboard composition."""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
-from decimal import Decimal
-from typing import Literal
+import socket
+import time
 from urllib import error, request
 
 import psycopg
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import Field, ValidationError
 
-from .api import PERIODS, _database_url, _report
-from .metrics import IncompleteCoverage, detail_rows
+from .api import PERIODS, _database_url
+from .dashboard_data import DataBuilder, DEFINITIONS
+from .dashboard_schema import CHART_CATALOG, ClosedModel, Composition, DataPlan, SpecViolation, validate_dashboard
 from .seed import DATASET_ID
 
 router = APIRouter(prefix="/api/demo-finance", tags=["synthetic-finance"])
 logger = logging.getLogger(__name__)
-
-CATALOG = {
-    "dataset": DATASET_ID,
-    "metrics": {
-        "revenue": "جمع خالص سطرهای REVENUE ثبت‌شده",
-        "cogs": "جمع خالص سطرهای COGS ثبت‌شده",
-        "opex": "جمع خالص سطرهای OPEX ثبت‌شده",
-        "operating_profit": "revenue - cogs - opex؛ فقط با پوشش کامل",
-    },
-    "periods": list(PERIODS),
-    "filters": {"opex_category": ["payroll", "shipping", "admin"]},
-    "views": ["card", "trend", "comparison", "bridge", "dashboard"],
-    "limits": "فقط دادهٔ مالی ساختگی آوریل تا سپتامبر ۲۰۲۶؛ علت تجاری مستقل ثبت نشده است.",
-}
-LABELS = {"revenue": "درآمد", "cogs": "بهای کالا", "opex": "هزینهٔ عملیاتی",
-          "operating_profit": "سود عملیاتی"}
-BUCKETS = {"revenue": "REVENUE", "cogs": "COGS", "opex": "OPEX"}
-CATEGORIES = {"shipping": "حمل", "payroll": "حقوق", "admin": "اداری"}
-SCOPE_MESSAGE = ("این ابزار برای ساخت و تحلیل داشبورد بر اساس داده‌های ViraData است. "
-                 "مثلاً بپرسید: «روند درآمد را نشان بده». ")
+MAX_MODEL_BYTES = 65_536
+MAX_CONTEXT_BYTES = 58_000
+MODEL_TIMEOUT = 40
+CATALOG = {"dataset": DATASET_ID, "metrics": DEFINITIONS, "periods": list(PERIODS),
+           "dimensions": ["period", "category", "cost_center", "bridge", "normalized"],
+           "filters": {"category": ["shipping", "payroll", "admin"]}, "chart_types": CHART_CATALOG,
+           "limits": "فقط دادهٔ مالی ساختگی آوریل تا سپتامبر ۲۰۲۶. جریان حمل، مقصد، تعداد سفارش و علت تجاری ثبت نشده است."}
 
 
-class Question(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class Question(ClosedModel):
     question: str = Field(min_length=2, max_length=500)
 
 
-class Plan(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    intent: Literal["overview", "metric", "trend", "compare", "bridge", "out_of_scope", "unavailable"]
-    metrics: list[str] = Field(max_length=4)
-    periods: list[str] = Field(max_length=6)
-    category: str | None = None
-    view: Literal["dashboard", "card", "trend", "comparison", "bridge", "none"]
+def fail(status: int, code: str, message: str, *, retryable: bool = False, validation: list[dict] | None = None):
+    detail = {"code": code, "message": message, "retryable": retryable}
+    if validation:
+        detail["validation"] = validation
+    raise HTTPException(status, detail)
 
 
 def configured() -> bool:
-    return all(os.getenv(key) for key in ("FINANCE_LLM_BASE_URL", "FINANCE_LLM_MODEL",
-                                           "FINANCE_LLM_API_KEY"))
+    return all(os.getenv(key) for key in ("FINANCE_LLM_BASE_URL", "FINANCE_LLM_MODEL", "FINANCE_LLM_API_KEY"))
 
 
 @router.get("/question-capability")
 def capability() -> dict:
-    return {"enabled": configured(), "catalog": CATALOG}
+    return {"enabled": configured(), "contract_version": "2.0", "catalog": CATALOG,
+            "limits": {"model_calls": 3, "supplementary_requests": 1, "rows": 100, "timeout_seconds_per_call": MODEL_TIMEOUT}}
 
 
-def plan_question(question: str) -> Plan:
-    """Use an OpenAI-compatible chat endpoint only to choose catalog identifiers."""
+def strict_json(raw: str | bytes) -> dict:
+    """One JSON object; tolerate fences, reject duplicate keys and nonfinite constants."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if not isinstance(raw, str):
+        raise TypeError("JSON text required")
+    raw = raw.strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, count=1, flags=re.I)[:-3].strip()
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def nonfinite(_):
+        raise ValueError("nonfinite JSON number")
+
+    def finite_float(value):
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("nonfinite JSON number")
+        return parsed
+
+    result = json.loads(raw, object_pairs_hook=pairs, parse_constant=nonfinite, parse_float=finite_float)
+    if not isinstance(result, dict):
+        raise ValueError("JSON object required")
+    return result
+
+
+def model_json(system: str, content: dict | str, *, stage: str, deadline: float | None = None) -> dict:
     if not configured():
-        raise HTTPException(503, "مدل پرسش مالی تنظیم نشده است؛ گزارش نمونه فعال است.")
+        fail(503, "model_unconfigured", "مدل پرسش مالی تنظیم نشده است؛ گزارش نمونه فعال است.")
     base = os.environ["FINANCE_LLM_BASE_URL"].rstrip("/")
     if not base.startswith(("https://", "http://127.0.0.1:", "http://localhost:")):
-        raise HTTPException(503, "نشانی سرویس مدل باید HTTPS یا localhost باشد.")
-    prompt = (
-        "You classify Persian questions about this synthetic finance dataset. Return ONLY a JSON object "
-        "with keys intent, metrics, periods, category, view. No numbers, explanation, SQL or extra keys. "
-        "intent: overview|metric|trend|compare|bridge|out_of_scope|unavailable. "
-        "For a dashboard from all reports or a general finance overview, use overview, "
-        "all four metrics, q2 and q3, category null, view dashboard. "
-        "Use out_of_scope for greetings, general research, unrelated opinions. "
-        "Use unavailable for related questions asking absent fields or dates; preserve the requested "
-        "unknown field in metrics or unknown date in periods so the application can explain it. "
-        "For why operating profit fell, use bridge, q2 and q3, revenue/cogs/opex/operating_profit. "
-        "Default unspecified quarter to q3 for a single amount, both quarters for compare, "
-        "and six months for trend. Category shipping/payroll/admin applies only to opex. "
-        "Never infer a business cause. Catalog: " + json.dumps(CATALOG, ensure_ascii=False)
-    )
+        fail(503, "model_unconfigured", "نشانی سرویس مدل باید HTTPS یا localhost باشد.")
+    user = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    if len(user.encode("utf-8")) > MAX_CONTEXT_BYTES:
+        fail(422, "data_limit", "حجم داده برای تحلیل بیش از سقف مجاز است؛ سؤال را محدودتر کنید.")
     payload = {"model": os.environ["FINANCE_LLM_MODEL"], "temperature": 0,
-               "response_format": {"type": "json_object"},
-               "messages": [{"role": "system", "content": prompt},
-                            {"role": "user", "content": question}]}
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = request.Request(base + "/chat/completions", data=body,
-                          headers={"Authorization": "Bearer " + os.environ["FINANCE_LLM_API_KEY"],
-                                   "Content-Type": "application/json"})
+               "max_tokens": 1400 if stage == "plan" else 5200, "response_format": {"type": "json_object"},
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    req = request.Request(base + "/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                          headers={"Authorization": "Bearer " + os.environ["FINANCE_LLM_API_KEY"], "Content-Type": "application/json"})
     try:
-        with request.urlopen(req, timeout=12) as response:
-            raw = response.read(65537)
-        if len(raw) > 65536:
-            raise ValueError("model response too large")
-        content = json.loads(raw)["choices"][0]["message"]["content"]
-        return Plan.model_validate_json(content)
-    except (error.URLError, TimeoutError, OSError) as exc:
-        raise HTTPException(503, "سرویس مدل در دسترس نیست یا پاسخ‌گویی آن زمان‌بر شد.") from exc
-    except (ValueError, KeyError, IndexError, TypeError, ValidationError) as exc:
-        logger.warning("finance model response invalid: %s", type(exc).__name__)
-        raise HTTPException(502, "پاسخ ساختاریافتهٔ مدل نامعتبر است.") from exc
+        remaining = min(MODEL_TIMEOUT, deadline - time.monotonic()) if deadline else MODEL_TIMEOUT
+        if remaining <= 0:
+            fail(504, "model_timeout", "زمان کل تحلیل مدل تمام شد؛ دوباره تلاش کنید.", retryable=True)
+        with request.urlopen(req, timeout=remaining) as response:
+            raw = response.read(MAX_MODEL_BYTES + 1)
+        if len(raw) > MAX_MODEL_BYTES:
+            fail(502, "invalid_json", "پاسخ سرویس مدل بیش از حد مجاز است.")
+        wrapper = strict_json(raw)
+        choice = wrapper["choices"][0]
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise TypeError("model message object required")
+        if choice.get("finish_reason") == "length":
+            fail(502, "model_truncated", "پاسخ مدل به سقف طول رسید؛ سؤال را محدودتر کنید.", retryable=True)
+        return strict_json(choice["message"]["content"])
+    except error.HTTPError as exc:
+        logger.warning("finance model HTTP failure stage=%s status=%s", stage, exc.code)
+        if exc.code in {401, 403}:
+            fail(503, "model_auth_error", "اعتبار اتصال سرویس مدل پذیرفته نشد؛ تنظیمات اتصال باید بررسی شود.")
+        if exc.code == 429 or exc.code >= 500:
+            fail(503, "model_unavailable", "سرویس مدل موقتاً در دسترس نیست؛ دوباره تلاش کنید.", retryable=True)
+        fail(502, "model_request_rejected", "سرویس مدل قالب درخواست را نپذیرفت؛ تنظیمات مدل باید بررسی شود.")
+    except (socket.timeout, TimeoutError):
+        fail(504, "model_timeout", "زمان پاسخ‌گویی سرویس مدل تمام شد؛ دوباره تلاش کنید.", retryable=True)
+    except error.URLError as exc:
+        code = "model_timeout" if isinstance(exc.reason, (socket.timeout, TimeoutError)) or "timed out" in str(exc.reason).lower() else "model_unavailable"
+        fail(504 if code == "model_timeout" else 503, code, "سرویس مدل پاسخ نداد؛ دوباره تلاش کنید.", retryable=True)
+    except OSError:
+        fail(503, "model_unavailable", "اتصال به سرویس مدل برقرار نشد.", retryable=True)
+    except (ValueError, KeyError, IndexError, TypeError, UnicodeError) as exc:
+        logger.warning("finance model JSON invalid stage=%s type=%s", stage, type(exc).__name__)
+        fail(502, "invalid_json", "سرویس مدل JSON معتبر برنگرداند؛ دوباره تلاش کنید.", retryable=True)
 
 
-def _unavailable(field: str) -> dict:
-    return {"status": "data_unavailable", "message": f"فیلد یا دورهٔ «{field}» در دادهٔ نمایشی موجود نیست. بازهٔ معتبر: فصل دوم و سوم ۲۰۲۶ و ماه‌های آوریل تا سپتامبر.",
-            "view": "none", "values": [], "drilldowns": []}
+PLAN_PROMPT = """You are a Persian finance data planner. Return ONLY JSON matching schema.
+Choose required bounded data queries, not a dashboard intent/view. No SQL, code, arbitrary fields or invented metrics.
+scope out_of_scope for unrelated questions; unavailable for missing dates/metrics/operational facts. Preserve scope; never substitute dates.
+Default available quarter comparison q2,q3. Temporal trends use six monthly periods sorted.
+Revenue trend requests revenue only and quarterly change if useful.
+General overview requests quarter KPIs, selected monthly series, expense breakdown. Managerial REPORT additionally needs prioritized changes, bridge and a source table.
+Strengths/weaknesses needs comparative financial metrics and changes, not generic overview.
+Shipping dashboard requests shipping AND opex for q2,q3 AND six months; optional cost_center opex category shipping. Shipping is a metric.
+Shipping example TWO SEPARATE queries: {"id":"quarters","metrics":["shipping","opex"],"periods":["q2","q3"],"dimension":"period","category":null}, {"id":"months","metrics":["shipping","opex"],"periods":["2026-04","2026-05","2026-06","2026-07","2026-08","2026-09"],"dimension":"period","category":null}.
+NEVER combine quarter and monthly periods in one query. With shipping metric category MUST be null. Category filter shipping applies ONLY metrics [opex].
+shipping+opex automatically provides shipping_share percentages. One shipping cost center need not get a breakdown chart.
+dimension period: rows periods, columns metrics. category/cost_center: opex only, max two periods; one period label/value, two label/q2/q3.
+category filter only with metrics [opex]. Prefer metric shipping for its own temporal series.
+bridge: q2,q3 plus revenue,cogs,opex,operating_profit; reconciled label/value signed effects.
+normalized: q2,q3 plus >=3 metrics; label/q2/q3 indices base q2=100; only if radar analytically useful.
+No flow dataset exists: Sankey unavailable. No causes recorded. At most six compact queries.
+Schema: """ + json.dumps(DataPlan.model_json_schema(), ensure_ascii=False)
 
 
-def execute(plan: Plan, conn: psycopg.Connection) -> dict:
-    """Ignore all model prose; read only approved report and parameterized detail rows."""
-    if plan.intent == "out_of_scope":
-        return {"status": "out_of_scope", "message": SCOPE_MESSAGE, "view": "none", "values": [], "drilldowns": []}
-    if plan.intent not in {"overview", "metric", "trend", "compare", "bridge", "unavailable"}:
-        raise HTTPException(502, "نیت مدل مجاز نیست.")
-    for metric in plan.metrics:
-        if metric not in LABELS:
-            return _unavailable(metric)
-    for period in plan.periods:
-        if period not in PERIODS:
-            return _unavailable(period)
-    if plan.category is not None and plan.category not in CATEGORIES:
-        return _unavailable(plan.category)
-    if plan.intent == "unavailable":
-        return _unavailable((plan.metrics + plan.periods + [plan.category or "فیلد درخواستی"])[0])
-    views = {"overview": "dashboard", "metric": "card", "trend": "trend", "compare": "comparison", "bridge": "bridge"}
-    if plan.view != views[plan.intent] or not plan.metrics or not plan.periods:
-        raise HTTPException(502, "ترکیب نیت و نمایش مدل نامعتبر است.")
-    if plan.category and (plan.metrics != ["opex"] or plan.intent != "metric"):
-        raise HTTPException(502, "فیلتر دسته برای این شاخص مجاز نیست.")
-    if plan.intent == "bridge" and (plan.periods != ["q2", "q3"] or set(plan.metrics) != set(LABELS)):
-        raise HTTPException(502, "پل سود فقط برای مقایسهٔ دو فصل معتبر است.")
-    if plan.intent == "overview" and (plan.periods != ["q2", "q3"] or set(plan.metrics) != set(LABELS) or plan.category):
-        raise HTTPException(502, "نمای کلی فقط برای دو فصل و چهار شاخص معتبر است.")
-    if plan.intent == "compare" and plan.periods != ["q2", "q3"]:
-        raise HTTPException(502, "مقایسه فقط برای دو فصل موجود است.")
-    if plan.intent == "trend" and (plan.periods != [f"2026-{m:02d}" for m in range(4, 10)] or plan.category):
-        raise HTTPException(502, "روند فقط برای شش ماه موجود است.")
-    if plan.intent == "metric" and len(plan.periods) != 1:
-        raise HTTPException(502, "کارت فقط یک دوره می‌پذیرد.")
+DESIGN_PROMPT = """Design a Persian RTL analytical dashboard from PROVIDED REAL BACKEND DATA. Return ONLY schema JSON.
+Return {kind:"dashboard",spec:{...}} or essential missing data request {kind:"data_request",queries:[...]}. One supplementary request allowed.
+Choose direct answer, title, component count/order, suitable charts, cards, tables, prioritized insights for THIS QUESTION. No fixed template.
+No HTML, JSX, SQL, JavaScript, raw chart options, calculated/invented numbers. Data rows, units, series immutable.
+Every number/date numeral/percent/ratio/magnitude in prose MUST be {{fact_id}} from facts. No digits or percent symbols in prose fields.
+This includes the year: NEVER type 2026 in a title, answer, baseline or scope. Say «سال دادهٔ نمونه» or omit the year.
+Example with dataset quarters: «حمل فصل سوم {{quarters:q3:shipping}} و تغییر آن {{quarters:change_pct:shipping}} است.» Use actual provided fact IDs.
+Do not write numbers as words to bypass references. Period names may be Persian words (فصل دوم, فصل سوم).
+Facts display includes unit: use provided display without recalculation. Cards use fact_id, charts dataset/fields, tables fields.
+Every insight MUST bind an actual COMPARISON fact placeholder in text, list matching fact_ids, explain explicit baseline and scope.
+favorable true means favorable change, false unfavorable; expense increase is negative. Split positive and negative observations.
+No definitive business cause/recommendation without evidence. Accounting bridge is reconciliation, not commercial cause proof.
+Scope mentions synthetic data/observed period/lack of causal evidence. No long-term trend claims from two quarters.
+Managerial report: explicit answer, prioritized changes, complementary charts, source table. Strengths/weaknesses: ranked favorable/unfavorable changes.
+Shipping dashboard: focus shipping, valid period comparison, monthly change, opex share. One cost center isn't meaningful breakdown chart.
+Revenue trend answer includes verified change. Use charts for analytical purpose; table/card better when chart unsuitable.
+Only chart catalog types. line/area >=3 ordered monthly points. grouped_bar >=2 same-unit series; q2/q3 rows with ONE metric use bar.
+Horizontal bar for category ranks. stacked_bar only payroll/shipping/admin additive parts. pie/donut/radial only breakdown positive total, 2..6 parts.
+composed only revenue+operating_profit, shipping+opex, shipping+shipping_share; different unit percentage on right axis.
+composed MUST contain EXACTLY TWO series. NEVER put shipping, opex AND shipping_share together: choose shipping+shipping_share or shipping+opex only.
+waterfall only bridge series value. radar only normalized dataset series q2,q3. No fake flows/raw incompatible radar.
+Chart x=label; series [{field,axis:left|right}], width half|full. layout lists ALL component IDs exactly once. Unique IDs. version="2.0".
+Keep <=6 cards, <=4 charts, <=1 table, <=5 concise insights unless question needs more. No missing-value cards.
+Schema: """ + json.dumps(Composition.model_json_schema(), ensure_ascii=False)
 
-    report = _report(conn)
-    snapshots = {**report["quarters"], **{item["month"]: item for item in report["monthly_trend"]}}
-    values = []
-    drilldowns = []
-    for period in plan.periods:
-        for metric in plan.metrics:
-            data = snapshots[period]["values"][metric]
-            amount, line_ids = data["amount_toman"], data.get("line_ids")
-            if metric == "operating_profit" and amount is not None:
-                line_ids = [line_id for component in BUCKETS
-                            for line_id in snapshots[period]["values"][component]["line_ids"]]
-            if plan.category:
-                start, end = PERIODS[period]
-                try:
-                    rows = detail_rows(conn, start, end, "OPEX", category_id=plan.category)
-                except IncompleteCoverage:
-                    rows = None
-                amount = str(sum((row["amount_toman"] for row in rows), Decimal(0))) if rows is not None else None
-                line_ids = [row["line_id"] for row in rows] if rows is not None else None
-            value = {"metric": metric, "label": (CATEGORIES[plan.category] if plan.category else LABELS[metric]),
-                     "period": period, "amount_toman": amount,
-                     "coverage": "complete" if amount is not None else "missing",
-                     "line_ids": line_ids, "unit": report["unit"]["code"],
-                     "formula": "revenue - cogs - opex" if metric == "operating_profit" else None}
-            values.append(value)
-            if line_ids is not None and metric in BUCKETS:
-                drilldowns.append({"period": period, "bucket": BUCKETS[metric],
-                                   "category_id": plan.category, "line_ids": line_ids})
-    if any(value["coverage"] == "missing" for value in values):
-        message = "پوشش داده برای یکی از شاخص‌ها یا دوره‌های درخواستی ناقص است؛ مقدار ناموجود صفر نیست."
-        return {"status": "data_unavailable", "message": message, "view": "none",
-                "values": values, "drilldowns": drilldowns, "dataset_id": report["dataset_id"],
-                "dataset_version": report["dataset_version"], "widgets": [], "insights": []}
-    if plan.intent in {"bridge", "overview"}:
-        bridge = report["profit_bridge"]
-        if bridge["coverage"] != "complete":
-            return {"status": "data_unavailable", "message": "پوشش داده برای پل سود ناقص است.",
-                    "view": "none", "values": values, "drilldowns": drilldowns,
-                    "dataset_id": report["dataset_id"], "dataset_version": report["dataset_version"],
-                    "widgets": [], "insights": []}
-        def billion(value: str) -> str:
-            amount = Decimal(value) / Decimal(1_000_000_000)
-            return ("+" if amount > 0 else "") + format(amount, "f")
-        message = ("تجزیهٔ حسابداری تغییر سود عملیاتی: تغییر درآمد "
-                   f"{billion(report['quarter_changes']['revenue']['amount_toman'])}، "
-                   f"بهای کالا {billion(report['quarter_changes']['cogs']['amount_toman'])} و "
-                   f"هزینهٔ عملیاتی {billion(report['quarter_changes']['opex']['amount_toman'])}؛ "
-                   f"تغییر سود {billion(bridge['profit_delta_toman'])} میلیارد تومان. "
-                   "این داده علت تجاری واقعی را مشخص نمی‌کند.")
-    elif plan.intent == "trend":
-        message = "روند ماهانهٔ شاخص‌های درخواستی از آوریل تا سپتامبر ۲۰۲۶."
-    elif plan.intent == "compare":
-        message = "مقایسهٔ شاخص‌های درخواستی میان فصل دوم و سوم ۲۰۲۶."
-    else:
-        amount = Decimal(values[0]["amount_toman"]) / Decimal(1_000_000_000)
-        message = f"{values[0]['label']} در {plan.periods[0]} سال ۲۰۲۶: {amount:g} میلیارد تومان ساختگی."
-    widgets = {
-        "overview": ["kpis", "trend", "comparison", "bridge", "expense_mix"],
-        "trend": ["trend"], "compare": ["comparison"],
-        "bridge": ["bridge"], "metric": ["card"],
-    }[plan.intent]
-    insights = []
-    if plan.intent in {"overview", "bridge"}:
-        insights.append({
-            "kind": "profit_reconciliation", "title": "تجزیهٔ حسابداری تغییر سود",
-            "amount_toman": bridge["profit_delta_toman"],
-            "basis": "Δسود = Δدرآمد − Δبهای کالا − Δهزینهٔ عملیاتی؛ علت تجاری واقعی از این داده اثبات نمی‌شود.",
-            "components": {key: report["quarter_changes"][key]["amount_toman"] for key in ("revenue", "cogs", "opex")},
-            "periods": ["q2", "q3"],
-            "line_ids": sorted({line_id for value in values for line_id in value["line_ids"] or []}),
-        })
-    result = {"status": "answered", "message": message, "view": plan.view,
-              "values": values, "drilldowns": drilldowns, "dataset_id": report["dataset_id"],
-              "dataset_version": report["dataset_version"],
-              "layout": "overview" if plan.intent == "overview" else "focus",
-              "widgets": widgets, "insights": insights}
-    if plan.intent in {"overview", "bridge", "trend", "compare"}:
-        result["report"] = report
-    if plan.intent in {"bridge", "overview"}:
-        result["bridge"] = bridge
-    return result
+
+def validate_model(model, payload: dict, stage: str):
+    try:
+        return model.model_validate(payload)
+    except ValidationError as exc:
+        fields = [".".join(str(p) for p in e["loc"]) for e in exc.errors()][:5]
+        issues = [{"field": ".".join(str(p) for p in e["loc"]), "type": e["type"], "message": e["msg"]} for e in exc.errors()][:5]
+        logger.warning("finance model schema invalid stage=%s fields=%s types=%s", stage, fields, [e["type"] for e in exc.errors()][:5])
+        unsupported = stage == "compose" and any(e["loc"][-1:] == ("type",) for e in exc.errors())
+        fail(502, "unsupported_chart" if unsupported else "invalid_spec", "مدل نمودار پشتیبانی‌نشده انتخاب کرد." if unsupported else "ساختار پاسخ مدل با قرارداد داده سازگار نیست؛ دوباره تلاش کنید.", retryable=True, validation=issues)
+
+
+def unavailable(message: str, *, status: str = "data_unavailable", calls: int = 0) -> dict:
+    return {"status": status, "message": message, "spec": None, "datasets": [], "facts": [],
+            "dataset_id": DATASET_ID, "dataset_version": None, "limitations": [message],
+            "meta": {"model_calls": calls, "supplementary_requests": 0}}
+
+
+def compact_context(builder: DataBuilder) -> dict:
+    datasets = []
+    for dataset in builder.datasets:
+        rows = [{k: v for k, v in row.items() if k not in {"drilldowns", "source_ids"}} | {"source_ids": row["source_ids"][:4], "source_count": len(row["source_ids"])} for row in dataset["rows"]]
+        datasets.append({**dataset, "rows": rows})
+    facts = [{k: fact[k] for k in ("id", "label", "value", "display", "unit", "comparison", "favorable")} for fact in builder.facts]
+    return {"datasets": datasets, "facts": facts}
+
+
+def execute(question: str, plan: DataPlan, builder: DataBuilder, *, deadline: float | None = None, model_calls: int = 1) -> dict:
+    builder.add(plan.queries)
+    if not any(fact["value"] is not None for fact in builder.facts):
+        return unavailable("پوشش داده برای شاخص‌های درخواستی ناقص است؛ مقدار ناموجود صفر نیست.", calls=model_calls)
+    supplemental = 0
+    repair = None
+    for _ in range(3 - model_calls):
+        context = {"question": question, "catalog": CATALOG, **compact_context(builder), "supplementary_request_allowed": model_calls < 2}
+        if repair:
+            context["repair"] = repair
+        draft = model_json(DESIGN_PROMPT, context, stage="compose", deadline=deadline)
+        model_calls += 1
+        try:
+            composition = validate_model(Composition, draft, "compose")
+        except HTTPException as exc:
+            if model_calls < 3 and isinstance(exc.detail, dict) and exc.detail["code"] in {"invalid_spec", "unsupported_chart"}:
+                repair = {"instruction": "Previous draft failed schema validation. Return a corrected dashboard spec, no new data request.",
+                          "code": exc.detail["code"], "validation": exc.detail.get("validation", []), "previous_draft": draft}
+                continue
+            raise
+        if composition.kind == "data_request":
+            if model_calls >= 3 or supplemental:
+                raise SpecViolation("data_limit", "سقف چرخهٔ تکمیل داده یا تعداد فراخوانی مدل تمام شده است.")
+            builder.add(composition.queries)
+            supplemental = 1
+            continue
+        try:
+            spec = validate_dashboard(composition.spec, builder.datasets, builder.facts)
+        except SpecViolation as exc:
+            logger.warning("finance dashboard validation code=%s field=%s", exc.code, exc.field or "structure")
+            if model_calls < 3:
+                repair = {"instruction": "Previous draft failed semantic validation. Correct this field and return dashboard spec only. Preserve real data; every prose number uses a valid fact placeholder.",
+                          "code": exc.code, "field": exc.field or "structure", "message": str(exc), "details": exc.details,
+                          "previous_draft": draft}
+                continue
+            raise
+        limitations = ["دادهٔ مالی ساختگی؛ بازهٔ آوریل تا سپتامبر ۲۰۲۶ و فقط سطرهای ثبت‌شده.",
+                       "تجزیهٔ حسابداری تغییر علت تجاری را اثبات نمی‌کند؛ جریان حمل، مقصد و تعداد سفارش موجود نیست."]
+        for dataset in builder.datasets:
+            limitations.extend(dataset["limitations"])
+        return {"status": "answered", "message": spec["answer"], "spec": spec, "datasets": builder.datasets,
+                "facts": builder.facts, "dataset_id": DATASET_ID, "dataset_version": builder.version,
+                "limitations": list(dict.fromkeys(limitations)), "meta": {"model_calls": model_calls, "supplementary_requests": supplemental}}
+    raise SpecViolation("invalid_spec", "مدل داشبورد نهایی تولید نکرد.")
 
 
 @router.post("/question")
 def ask(payload: Question) -> dict:
+    deadline = time.monotonic() + 110
     if not configured():
-        raise HTTPException(503, "مدل پرسش مالی تنظیم نشده است؛ گزارش نمونه فعال است.")
-    # Reject explicit unsupported years even if a model attempts to silently remap them.
-    years = re.findall(r"(?<!\d)(?:20\d{2}|۲[۰-۹]{3})(?!\d)", payload.question)
-    if any(year.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")) != "2026" for year in years):
-        return _unavailable(years[0])
-    unsupported_quarter = re.search(r"فصل\s*(?:اول|یکم|چهارم|۱|۴|1|4)(?!\d)", payload.question)
-    if unsupported_quarter:
-        return _unavailable(unsupported_quarter.group())
-    plan = plan_question(payload.question)
-    if plan.intent == "out_of_scope":
-        return execute(plan, None)
+        fail(503, "model_unconfigured", "مدل پرسش مالی تنظیم نشده است؛ گزارش نمونه فعال است.")
+    normalized = payload.question.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    years = re.findall(r"(?<!\d)20\d{2}(?!\d)", normalized)
+    unsupported_quarter = re.search(r"فصل\s*(?:اول|یکم|چهارم|1|4)(?!\d)", normalized)
+    if any(year != "2026" for year in years) or unsupported_quarter:
+        return unavailable("دورهٔ درخواستی موجود نیست؛ داده فقط فصل دوم و سوم سال ۲۰۲۶ را پوشش می‌دهد.")
+    plan_context = {"question": payload.question, "catalog": CATALOG}
+    draft = model_json(PLAN_PROMPT, plan_context, stage="plan", deadline=deadline)
+    model_calls = 1
+    try:
+        plan = validate_model(DataPlan, draft, "plan")
+    except HTTPException as exc:
+        if not isinstance(exc.detail, dict) or exc.detail["code"] != "invalid_spec":
+            raise
+        plan_context["repair"] = {"instruction": "Correct invalid bounded data plan using validation messages. Return schema only; do not invent missing data.",
+                                  "validation": exc.detail.get("validation", []), "previous_draft": draft}
+        plan = validate_model(DataPlan, model_json(PLAN_PROMPT, plan_context, stage="plan", deadline=deadline), "plan")
+        model_calls = 2
+    if plan.scope != "finance":
+        message = ("این ابزار فقط دربارهٔ دادهٔ مالی نمایشی پاسخ می‌دهد؛ مانند روند درآمد یا هزینهٔ حمل." if plan.scope == "out_of_scope" else
+                   "دادهٔ لازم برای سؤال موجود نیست. فقط شاخص‌های مالی فصل دوم و سوم ۲۰۲۶ و شش ماه آن موجود است؛ مقصد، سفارش و علت تجاری ثبت نشده‌اند.")
+        return unavailable(message, status="out_of_scope" if plan.scope == "out_of_scope" else "data_unavailable", calls=model_calls)
     try:
         with psycopg.connect(_database_url(), connect_timeout=3) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            return execute(plan, conn)
+            return execute(payload.question, plan, DataBuilder(conn), deadline=deadline, model_calls=model_calls)
+    except SpecViolation as exc:
+        logger.warning("finance dashboard rejected code=%s", exc.code)
+        fail(422 if exc.code in {"insufficient_data", "data_limit"} else 502, exc.code, str(exc), retryable=exc.code not in {"insufficient_data", "data_limit"})
     except psycopg.Error:
-        raise HTTPException(503, "پایگاه دادهٔ مالی در دسترس نیست.") from None
+        fail(503, "database_unavailable", "پایگاه دادهٔ مالی در دسترس نیست.", retryable=True)

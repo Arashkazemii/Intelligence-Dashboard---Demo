@@ -25,17 +25,13 @@ export interface LineResult {
   coverage: 'complete' | 'missing'; bucket_subtotal_toman: string | null; lines: FinanceLine[] | null
 }
 
-export interface QuestionValue { metric: Metric; label: string; period: Period; amount_toman: string | null; coverage: 'complete' | 'missing'; line_ids: string[] | null; unit: string }
+import type { DashboardDataset, DashboardFact, DashboardSpec } from './dashboard-types'
+
 export interface QuestionAnswer {
   status: 'answered' | 'out_of_scope' | 'data_unavailable'; message: string
-  view: 'none' | 'card' | 'trend' | 'comparison' | 'bridge' | 'dashboard'
-  values: QuestionValue[]; dataset_id?: string; dataset_version?: string
-  layout?: 'overview' | 'focus'
-  widgets?: ('kpis' | 'card' | 'trend' | 'comparison' | 'bridge' | 'expense_mix')[]
-  insights?: { kind: 'profit_reconciliation'; title: string; amount_toman: string; basis: string; components: Record<'revenue' | 'cogs' | 'opex', string>; periods: ['q2', 'q3']; line_ids: string[] }[]
-  report?: FinanceReport
-  drilldowns: { period: Period; bucket: Bucket; category_id: string | null; line_ids: string[] }[]
-  bridge?: FinanceReport['profit_bridge']
+  spec: DashboardSpec | null; datasets: DashboardDataset[]; facts: DashboardFact[]
+  dataset_id: string; dataset_version: string; limitations: string[]
+  meta: { model_calls: number; supplementary_requests: number }
 }
 
 export async function loadQuestionCapability(signal?: AbortSignal): Promise<{ enabled: boolean }> {
@@ -45,13 +41,17 @@ export async function loadQuestionCapability(signal?: AbortSignal): Promise<{ en
 export async function askQuestion(question: string, signal?: AbortSignal): Promise<QuestionAnswer> {
   const response = await fetch('/api/demo-finance/question', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question }), signal })
   if (!response.ok) {
-    if (response.status === 503) throw new Error('سرویس پرسش در دسترس نیست. اتصال مدل و پایگاه داده را بررسی کنید.')
-    if (response.status === 502) throw new Error('پاسخ مدل نامعتبر بود. دوباره تلاش کنید.')
-    throw new Error(`خطای API: ${response.status}`)
+    const body: unknown = await response.json().catch(() => null)
+    const detail = body && typeof body === 'object' && 'detail' in body ? body.detail : body
+    const message = typeof detail === 'string' ? detail : detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string' ? detail.message : null
+    if (message) throw new Error(message)
+    if (response.status === 503) throw new Error('سرویس مدل موقتاً در دسترس نیست. کمی بعد دوباره تلاش کنید.')
+    if (response.status === 504) throw new Error('مهلت پاسخ سرویس مدل تمام شد. دوباره تلاش کنید.')
+    if (response.status === 502) throw new Error('پاسخ سرویس مدل قابل پردازش نیست. دوباره تلاش کنید.')
+    throw new Error(`دریافت پاسخ با خطای ${response.status} روبه‌رو شد.`)
   }
   const value = await response.json() as QuestionAnswer
-  const allowedWidgets = ['kpis', 'card', 'trend', 'comparison', 'bridge', 'expense_mix']
-  if (!value || !['answered', 'out_of_scope', 'data_unavailable'].includes(value.status) || !Array.isArray(value.values) || !Array.isArray(value.drilldowns) || typeof value.message !== 'string' || (value.status === 'answered' && (!value.dataset_id || !value.dataset_version || !Array.isArray(value.widgets) || !value.widgets.every(widget => allowedWidgets.includes(widget)) || !Array.isArray(value.insights) || (value.widgets.some(widget => ['trend', 'comparison', 'bridge', 'expense_mix'].includes(widget)) && !value.report)))) throw new Error('پاسخ پرسش نامعتبر است.')
+  if (!value || !['answered', 'out_of_scope', 'data_unavailable'].includes(value.status) || typeof value.message !== 'string' || !Array.isArray(value.datasets) || !Array.isArray(value.facts) || !Array.isArray(value.limitations) || (value.status === 'answered' && (!value.spec || value.spec.version !== '2.0' || !Array.isArray(value.spec.layout) || !Array.isArray(value.spec.cards) || !Array.isArray(value.spec.charts) || !Array.isArray(value.spec.tables) || !Array.isArray(value.spec.insights)))) throw new Error('ساختار پاسخ دریافتی با نسخهٔ داشبورد سازگار نیست. صفحه را تازه کنید و دوباره تلاش کنید.')
   return value
 }
 
